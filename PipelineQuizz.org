@@ -1,0 +1,486 @@
+#+title: Projet Forensic xModel 
+* Objectifs
+** Partie 1
+- Générer les 300 Q/R à partir de la base de connaissances fournis
+- Choisir le meilleur LLM (Lllama, Qwen, Gemma)
+  Quelle est le meilleur par rapport à nos données
+- Evaluer les réponses et sélectionner le meilleur LLM
+  Se baser sur les librairies et les métriques d'évaluation
+** Partie 2
+- Appliquer le RAG
+  Couplage de votre meilleur LLM et de votre base de connaissance
+- Proposer deux techniques d'optimisation du RAG
+- Evaluer et comparer avec le RAG simple
+
+* Résolution
+** Installation & Importations
+#+begin_src  python
+#Installation 
+!pip install --upgrade transformers datasets accelerate bitsandbytes peft trl
+!pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+!pip install pymupdf
+!pip install rouge-score bert-score nltk
+!pip install sentence-transformers faiss-cpu
+
+#Importations
+from unsloth import FastLanguageModel
+import fitz
+import re
+import json
+import random
+from typing import Dict, List
+from transformers import pipeline, AutoTokenizer, AutoModelForCauselLM
+import torch
+from tqdm.auto import tqdm
+from pathlib import Path
+from rouge_score import rouge_scorer
+from nltk.translate import score
+import numpy as np
+from collections import Counter
+from IPython.display import FileLink
+import pandas as pd
+from sentence_tranformers import SentenceTransformer
+import faiss
+from sentence_transformers import CrossEncoder
+#+end_src
+
+
+** Récupération de la base de connaissances et Chunking
+#+begin_src python
+# Chemin du répertoire de la base de connaissances (chemin relatif à Kaggle)
+pdf_folder = '/kaggle/input/forensic/'
+pdf_files = [os.path.join(pdf_folder, f) for f in os.listdir(pdf_folder) if f.lower().endswith('.pdf')]
+
+# Fonction d'extraction de texte 
+def extract_text_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    full_text = ""
+    for page in doc:
+        full_text += page.get_text("text") + "\n\n"
+    doc.close()
+    return full_text.strip()
+
+all_text = ""
+for pdf in pdf_files:
+    text = extract_text_from_pdf(pdf)
+    all_text += f"\n\n-- Document: {os.path.basename(pdf)} -- \n\n" + text
+
+# Creation du fichier qui nous fera office de base de connaissances
+with open("corpus_forensic.txt", "w", encoding="utf-8") as f:
+    f.write(all_text)
+
+print(f"Texte total extrait {len(all_text)}")
+
+# Chunking du texte
+def chunk_text(text, max_length=1200):
+    chunks = []
+    current = ""
+    for line in text.split("\n"):
+        if len(current) + len(line) > max_length:
+            chunks.append(current.strip())
+            current = line
+        else:
+            current += " " + line
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+chunks = chunk_text(all_text)
+print(f"{len(chunks)} chunks créés")
+#+end_src
+
+** Génération des Questions/Réponses
+#+begin_src python
+# Modele choisi pour la génération de Q/A
+model_name = "unsloth/gemma-2-9b-it-bnb-4bit"
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name,
+    max_seq_length=4096,
+    dtype=None,
+    load_in_4bit=True,
+)
+FastLanguageModel.for_inference(model)
+
+# Fonction des questions réponses
+def generate_qa(chunk):
+    # Prompt utilisé 
+    prompt = f"""Tu es un générateur QA pour digital forensics. Pour ce chunk de texte UNIQUEMENT :
+
+- Génère EXACTEMENT 6 à 8 questions-réponses différentes et pointues.
+- Questions variées : outils, commandes, formats de fichiers, artefacts par OS, étapes d'analyse, timelines, registres, prefetch, etc.
+- INTERDICTION ABSOLUE : ne répète JAMAIS une question ou un thème similaire à ceux déjà générés auparavant.
+- Ne pose PAS de questions sur Volatility pslist, mémoire vive ou listes de processus sauf si le chunk en parle explicitement de façon nouvelle.
+- Réponses : courtes, extraites mot pour mot ou presque du texte.
+- Réponds UNIQUEMENT avec le JSON valide. Pas de texte avant/après. Pas de markdown.
+
+Texte du chunk :
+{chunk[:3000]}
+
+Génère UNIQUEMENT le JSON valide maintenant. Varie fortement les questions.
+Assure-toi de générer EXACTEMENT 6 à 8 paires complètes. Termine toujours par ] et rien après.
+Tu DOIS générer exactement 6 paires complètes. Chaque paire doit être un objet JSON complet avec "question" et "answer" valides. Ne laisse JAMAIS un objet ouvert ou une virgule en trop. Si le chunk est court, génère moins mais toujours complet."""
+
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    
+    with torch.no_grad():
+        outputs = model.generate(
+        ,**inputs,
+        max_new_tokens=600,      
+        temperature=0.1,
+        top_p=0.95,
+        do_sample=False,
+        pad_token_id=tokenizer.eos_token_id
+    )
+    
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return response
+
+# Fonction d'extraction des réponses
+def extract_json_from_response(response):
+    match = re.search(r'\[\s*(?:\{[^}]*\}\s*,?\s*)*\{[^}]*\}\s*\]', response, re.DOTALL)
+    
+    if not match:
+        match = re.search(r'\[.*?\](?![^{]*\{)', response, re.DOTALL)
+    
+    if match:
+        json_str = match.group(0)
+    else:
+        json_str = response.strip()
+        if not json_str.startswith('['):
+            start = json_str.find('[')
+            if start != -1:
+                json_str = json_str[start:]
+    
+    json_str = json_str.strip()
+    
+    if json_str.endswith('}') and not json_str.endswith(']'):
+        json_str += ']'
+    if json_str.endswith(',]'):
+        json_str = json_str[:-2] + ']'
+    json_str = re.sub(r',\s*]', ']', json_str)
+    
+    try:
+        qa_list = json.loads(json_str)
+        if isinstance(qa_list, list) and qa_list:
+            if all(isinstance(item, dict) and "question" in item and "answer" in item for item in qa_list):
+                return qa_list
+            else:
+                print("Structure invalide (pas tous dicts avec question/answer)")
+                return []
+        else:
+            print("Pas une liste non-vide")
+            return []
+    except json.JSONDecodeError as e:
+        print(f"Erreur JSON persistante : {e}")
+        print("Tentative de JSON extrait :", json_str[:400])
+        print("Réponse complète (tronquée) :", response[:800])
+        return []
+
+all_qa_pairs = []
+
+for chunk in tqdm(chunks, desc="Génération Q/R"):
+    if not chunk.strip():
+        continue
+        
+    raw_response = generate_qa(chunk)
+    qa_list = extract_json_from_response(raw_response)
+    
+    if qa_list:
+        all_qa_pairs.extend(qa_list)
+    else:
+        print(f"Échec parsing sur un chunk → ignoré")
+
+with open("forensic_qa_dataset.json", "w", encoding="utf-8") as f:
+    json.dump(all_qa_pairs, f, ensure_ascii=False, indent=2)
+
+print(f"Total Q/R générées et parsées : {len(all_qa_pairs)}")
+#+end_src
+
+** Chargement du dataset Q/R (300 Q/R choisies)
+#+begin_src python
+# Chemin de notre dataset (nettoyé) (chemin relatif à kaggle)
+json_path = Path("/kaggle/input/qadataset/forensic_qa_dataset.json")
+
+if not json_path.exists():
+    print("Fichier non trouvé")
+else:
+    with open(json_path, 'r', encoding='utf-8') as f:
+        all_qa = json.load(f)
+    
+    print(f"Total paires chargées : {len(all_qa)}")
+    
+    if all_qa and isinstance(all_qa[0], dict) and "question" in all_qa[0] and "answer" in all_qa[0]:
+        print("Exemple première paire :", all_qa[0])
+    else:
+        print("Structure inattendue")
+    
+    if len(all_qa) >= 300:
+        sampled_qa = random.sample(all_qa, 300)
+    else:
+        sampled_qa = all_qa
+        print(f"Moins de 300 paires ({len(sampled_qa)})")
+    
+    questions = [item["question"] for item in sampled_qa]
+    ground_truths = [item["answer"] for item in sampled_qa]
+    
+    print(f"Prêt à tester {len(questions)} questions.")
+#+end_src
+
+#+RESULTS:
+
+** Tests Réponses LLM (Llama, Qwen, Gemma)
+#+begin_src python
+# Chargement du modéle
+def load_model(model_name):
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name,
+        max_seq_length=2048,
+        dtype=None,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(model)
+    return model, tokenizer
+
+# Fonction de génération des reponses
+def generate_response(model, tokenizer, question):
+    # Prompt pour réponse des LLM
+    prompt = f"""Tu es un expert en digital forensics. Réponds **UNIQUEMENT** par la réponse courte exacte. Pas de phrase complète, pas d'explication, pas d'introduction, pas de conclusion. Juste le contenu factuel attendu.
+
+Question : {question}
+
+Réponse :"""
+    
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            ,**inputs,
+            max_new_tokens=60,
+            temperature=0.0,
+            do_sample=False,
+            repetition_penalty=1.1,
+            eos_token_id=tokenizer.eos_token_id
+        )
+    
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    if "Réponse :" in response:
+        return response.split("Réponse :")[-1].strip()
+    else:
+        return response.strip().replace(prompt, "").strip()
+
+# Liste des modeles de notre etude comparatif (nous pouvons les changer par la suite)
+models_to_test = {
+    "Gemma-2-9B": "unsloth/gemma-2-9b-it-bnb-4bit",
+    "Qwen2.5-7B": "unsloth/Qwen2.5-7B-Instruct-bnb-4bit",
+    "Llama-3.2-3B": "unsloth/Llama-3.2-3B-Instruct-bnb-4bit"
+}
+
+results = {}
+
+for name, model_path in models_to_test.items():
+    print(f"\n=== Test de {name} ===")
+    
+    model, tokenizer = load_model(model_path)
+    
+    predictions = []
+    for q in tqdm(questions, desc=f"Génération {name}"):
+        pred = generate_response(model, tokenizer, q)
+        predictions.append(pred)
+    
+    results[name] = predictions
+    
+    print(f"{name} terminé ({len(predictions)} réponses générées)")
+#+end_src
+
+** Evaluation & Meilleur LLM
+#+begin_src python
+# Fonction de nettoyage des réponses recus des modeles
+def clean_response(text):
+    text = text.strip()
+    prefixes = ["La réponse est", "Il s'agit de", "C'est", "Réponse :", "L'outil est", "L'action est"]
+    for p in prefixes:
+        text = text.replace(p, "", 1).strip()
+    text = text.split('\n')[0].split('.')[0].strip()
+    text = re.sub(r'`|\*|_', '', text).strip()
+    return text
+
+# Nettoies toutes les réponses
+for model_name in results:
+    results[model_name] = [clean_response(p) for p in results[model_name]]
+
+# Fonction de normalisation des réponses    
+def normalize_response(s):
+    s = s.lower()
+    s = re.sub(r'\b(a|an|the)\b', ' ', s)
+    s = re.sub(r'[^a-z0-9\s]', '', s)
+    s = ' '.join(s.split())
+    return s.strip()
+
+def exact_match(pred, gt):
+    return normalize_response(pred) == normalize_response(gt)
+
+def f1_token(pred, gt):
+    p = normalize_response(pred).split()
+    g = normalize_response(gt).split()
+    common = Counter(p) & Counter(g)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0
+    precision = num_same / len(p)
+    recall = num_same / len(g)
+    return 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+# Calcul des métriques
+scores = {}
+
+for model_name, preds in results.items():
+    em = []
+    f1 = []
+    rougeL = []
+    
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    
+    for p, gt in zip(preds, ground_truths):
+        em.append(1 if exact_match(p, gt) else 0)
+        f1.append(f1_token(p, gt))
+        rougeL.append(scorer.score(gt, p)['rougeL'].fmeasure)
+    
+    # Métrique BERTScore
+    _, _, bert_f1 = score(preds, ground_truths, lang="en", rescale_with_baseline=True)
+    
+    scores[model_name] = {
+        "Exact Match": np.mean(em),
+        "F1 Token": np.mean(f1),
+        "ROUGE-L": np.mean(rougeL),
+        "BERTScore F1": bert_f1.mean().item()
+    }
+
+# Affichage des métriques
+df = pd.DataFrame(scores).T
+df = df.round(4)
+print("\n Résultats comparatifs des LLMs")
+print(df)
+
+# Meilleur modèle
+best_model = df["BERTScore F1"].idxmax()
+print(f"\nLe meilleur modèle selon BERTScore : {best_model} ({df.loc[best_model, 'BERTScore F1']:.4f})") 
+#+end_src
+
+** RAG (Retrieval Augmented Generation)
+#+begin_src python
+# Modèle d'embedding
+embedder = SentenceTransformer('paraphrase-multilingual-mpnet-base-v2')
+
+# Embed tous les chunks
+chunk_embeddings = embedder.encode(chunks, show_progress_bar=True, batch_size=32)
+chunk_embeddings = np.array(chunk_embeddings).astype('float32')
+
+# Cration de l'index FAISS
+dimension = chunk_embeddings.shape[1]
+index = faiss.IndexFlatIP(dimension)
+faiss.normalize_L2(chunk_embeddings)
+index.add(chunk_embeddings)
+
+print(f"Index FAISS créé avec {index.ntotal} vecteurs")
+
+# Fonction de génération du RAG
+def rag_generate(question, model, tokenizer, top_k=3):
+    q_emb = embedder.encode([question])[0].astype('float32')
+    faiss.normalize_L2(q_emb.reshape(1, -1))
+    
+    distances, indices = index.search(q_emb.reshape(1, -1), top_k)
+    
+    retrieved = []
+    for idx in indices[0]:
+        if idx != -1:
+            retrieved.append(chunks[idx])
+    
+    context = "\n\n".join(retrieved)
+    
+    # Prompt pour le RAG
+    prompt = f"""Tu es un expert en digital forensics. Utilise UNIQUEMENT les informations suivantes pour répondre.
+
+Contexte extrait :
+{context}
+
+Question : {question}
+
+Réponds UNIQUEMENT par la réponse courte et exacte, sans explication :
+Réponse :"""
+    
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            ,**inputs,
+            max_new_tokens=60,
+            temperature=0.0,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    if "Réponse :" in response:
+        return response.split("Réponse :")[-1].strip()
+    return response.strip()
+
+# Chargement de notre modele jugé meilleur 
+model_name = "unsloth/Llama-3.2-3B-Instruct-bnb-4bit"
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name,
+    max_seq_length=2048,
+    dtype=None,
+    load_in_4bit=True,
+)
+FastLanguageModel.for_inference(model)
+
+# Prédictions avec RAG
+rag_predictions = []
+for q in tqdm(questions, desc="Génération RAG"):
+    pred = rag_generate(q, model, tokenizer, top_k=3)
+    rag_predictions.append(pred)
+#+end_src
+
+** Optimisation options on RAG
+#+begin_src python
+reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device='cuda')
+
+def rag_with_reranking(question, top_k_retrieve=10, top_k_final=3):
+    q_emb = embedder.encode([question])[0].astype('float32')
+    faiss.normalize_L2(q_emb.reshape(1, -1))
+    
+    distances, indices = index.search(q_emb.reshape(1, -1), top_k_retrieve)
+    
+    pairs = [[question, chunks[idx]] for idx in indices[0] if idx != -1]
+    scores = reranker.predict(pairs)
+    
+    sorted_idx = np.argsort(scores)[::-1][:top_k_final]
+    retrieved = [chunks[indices[0][i]] for i in sorted_idx]
+    
+    context = "\n\n".join(retrieved)
+#+end_src
+
+** Ré-évaluation et Comparaison
+#+begin_src python
+rag_em = [exact_match(p, gt) for p, gt in zip(rag_predictions, ground_truths)]
+rag_f1 = [f1_token(p, gt) for p, gt in zip(rag_predictions, ground_truths)]
+rag_rouge = [scorer.score(gt, p)['rougeL'].fmeasure for p, gt in zip(rag_predictions, ground_truths)]
+_, _, rag_bert = score(rag_predictions, ground_truths, lang="fr" if "fr" in questions[0].lower() else "en")
+
+rag_scores = {
+    "Exact Match": np.mean(rag_em),
+    "F1 Token": np.mean(rag_f1),
+    "ROUGE-L": np.mean(rag_rouge),
+    "BERTScore F1": rag_bert.mean().item()
+}
+
+print("\nScores SANS RAG (précédents) :")
+print(df)
+
+print("\nScores AVEC RAG :")
+print(pd.Series(rag_scores).to_frame().T.round(4))
+
+print(f"Gain BERTScore : {rag_scores['BERTScore F1'] - df.loc['Llama-3.2-3B', 'BERTScore F1']:.4f}")
+#+end_src
