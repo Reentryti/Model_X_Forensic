@@ -366,6 +366,7 @@ print(df)
 best_model = df["BERTScore F1"].idxmax()
 print(f"\nLe meilleur modèle selon BERTScore : {best_model} ({df.loc[best_model, 'BERTScore F1']:.4f})") 
 #+end_src
+[[file:Metriques/Display1.png]]
 
 ** RAG (Retrieval Augmented Generation)
 #+begin_src python
@@ -484,3 +485,4 @@ print(pd.Series(rag_scores).to_frame().T.round(4))
 
 print(f"Gain BERTScore : {rag_scores['BERTScore F1'] - df.loc['Llama-3.2-3B', 'BERTScore F1']:.4f}")
 #+end_src
+[[file:Metriques/Display2.png]]
