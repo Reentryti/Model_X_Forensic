@@ -16,15 +16,12 @@ L'approche repose sur une génération contrôlée de questions-réponses et une
 
 ## Prérequis
 
-### Logiciels nécessaires
+### Environnement de travail
 
-- **Python 3.8+**
-- **FastAPI**
-- **Uvicorn**
-- **Scikit-learn**
-- **Pickle**
+- **Python 3.8+ (local)**
+- **Kaggle / Colab (cloud)**
 
-### Installation des dépendances
+### Installation des dépendances (optionnel)
 
 Crée un environnement virtuel et installe les dépendances nécessaires avec la commande suivante :
 
@@ -32,29 +29,37 @@ Crée un environnement virtuel et installe les dépendances nécessaires avec la
 pip install -r requirements.txt
 ```
 
-Exemple de contenu du fichier `requirements.txt` :
-```txt
-fastapi
-uvicorn
-scikit-learn
-numpy
-```
-
 ---
 
 ## Pipeline d'entrainement
 
 ### Base de connaissances
+- Documents PDF lié au Digital Forensic
+- Découpage en chunks
+- Aucune génération hors contenu des documents
 
 ### Génération des questions-réponses
+- Génération de 6 à 8 questions réponses techniques
+- Réponses courtes
 
 ### Génération multi LLM
+Chaque question recoit une réponse générée par trois LLMs choisis
 
 ### Sélection meilleur réponse
+Sélection en fonction des métriques de:
+- précision technique
+- d'absence d'hallucinations
+- de fidélité par rapport au ground_truths
 
 ### Fine-tuning du modéle
+Le dataset est utilisé pour:
+- améliorer la cohérence et la précision des réponses
+- renforcer la spécialisation en digital forensic
 
 ### Intégration d'un Retrival Augmented Generation (RAG)
+- Actualisation des connaissances sans rééntrainement
+- Plus de limite concernant les hallucinations
+- Adapter le modele à de nouvelles données
 
 ---
 
