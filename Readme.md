@@ -5,6 +5,13 @@ L'approche repose sur une génération contrôlée de questions-réponses et une
 
 ---
 
+> **Notebook**  
+> Les étapes de l'entrainement peuvent être directement visualisé depuis PipelineQuizz.org.  
+> Le notebook (format Raw) sera également disponible.
+> Noté que ce dernier fait lieu de brouillon
+
+---
+
 ## Objectifs
 
 - Construire une base de données (forensic_qa_dataset.json) de 300 questions.
@@ -67,10 +74,10 @@ Le dataset est utilisé pour:
 
 ```plaintext
 .
-├── Pipeline.org           # Pipeline utilisé et interprétation des résultats
+├── PipelineQuizz.org      # Pipeline utilisé et interprétation des résultats
 ├── Data                   # Base de connaissance utilisée (peut être améliorée)
-├── Sample_QR              # Échantillon de 300 questions/réponses
-├── prediction.json        # Métriques de performance
+├── forensic_qa_dataset    # Échantillon de 300 questions/réponses
+├── Metriques/             # Métriques de performance
 ├── requirements.txt       # Fichier listant les dépendances Python
 └── README.md              # Documentation du projet
 ```
