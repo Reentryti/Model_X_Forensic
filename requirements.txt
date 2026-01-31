@@ -1,0 +1,30 @@
+# Libraries principales pour chargement des LLM
+transformers>=4.45.0
+accelerate>=0.33.0
+bitsandbytes>=0.43.3
+peft>=0.12.0
+trl>=0.11.0
+
+# Unsloth 
+unsloth @ git+https://github.com/unslothai/unsloth.git
+
+# Sentence Transformers & embeddings (RAG)
+sentence-transformers>=3.0.0
+
+# FAISS pour les vecteurs
+faiss-cpu>=1.8.0 ; platform_system != "Darwin"
+
+# Métriques d'évaluation
+rouge-score>=0.1.2
+bert-score>=0.3.13
+nltk>=3.8.1
+
+# Utilitaires divers
+tqdm>=4.66.0
+numpy>=1.26.0
+pandas>=2.2.0
+torch>=2.4.0
+cross-encoder>=1.0.0
+
+# Extraction PDF
+PyMuPDF>=1.24.0  # fitz
