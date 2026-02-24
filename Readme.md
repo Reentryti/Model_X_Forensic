@@ -68,14 +68,18 @@ Le dataset est utilisé pour:
 - Plus de limite concernant les hallucinations
 - Adapter le modele à de nouvelles données
 
+### Techniques d'optimisation du RAG
+- Reranking: Amélioration de la recherche vectorielle via un modèle plus précis.
+- Hybrid Search: Combine recherche sémantique et lexicale, puis applique un reranking.
 ---
 
 ## Structure du projet
 
 ```plaintext
 .
-├── PipelineQuizz.org      # Pipeline utilisé et interprétation des résultats
-├── Data                   # Base de connaissance utilisée (peut être améliorée)
+├── PipelineQuizz.org      # Pipeline complet utilisé et interprétation des résultats
+├── Samples                # Dataset de questions-réponses (forensics)
+├── RagOptimizer.org       # Partie 1 du pipeline
 ├── forensic_qa_dataset    # Échantillon de 300 questions/réponses
 ├── Metriques/             # Métriques de performance
 ├── requirements.txt       # Fichier listant les dépendances Python

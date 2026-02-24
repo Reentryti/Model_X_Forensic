@@ -1,0 +1,625 @@
+#+title: Partie 2 : Retrieval Augmented Generation
+* Objectives
+** Appliquer le Rag
+Appliquer le RAG avec Chroma DB comme  base vectorielle
+Fine Tuner le LLM
+** Optimisation
+Proposer deux techniques d'optimisation du RAG
+ - Reranking
+ - Hybrid Search
+** Evaluation
+- Evaluer avec RAGAS ou DeepEval
+- Comparer : LLM seul vs RAG simple vs RAG amélioré vs  RAG Fine Tuné
+
+* Pipeline
+** Installation & Importations
+
+#+begin_src python
+# Installations
+!pip install -q --upgrade transformers datasets accelerate bitsandbytes peft trl
+!pip install -q "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+!pip install -q pymupdf
+!pip install -q rouge-score bert-score nltk
+!pip install -q sentence-transformers
+!pip install -q chromadb
+!pip install -q matplotlib scikit-learn
+!pip install -q ragas google-genai
+!pip install -q langgraph langchain langchain-community
+!pip install -q duckduckgo-search
+
+# Importations
+import os, re, json, random
+from typing import Dict, List, Tuple, Literal
+
+import fitz
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from tqdm.auto import tqdm
+from collections import Counter
+from IPython.display import display
+
+from unsloth import FastLanguageModel
+from rouge_score import rouge_scorer
+from bert_score import score as bert_score_fn
+from sentence_transformers import SentenceTransformer, CrossEncoder
+import chromadb
+
+import nltk
+nltk.download('punkt', quiet=True)
+
+SEED = 42
+random.seed(SEED)
+torch.manual_seed(SEED)
+#+end_src
+
+** Chargement du sample de 300 QR et de la base de connaissances
+
+#+begin_src python
+# Chargement des  Q/R générées
+qa_path = Path("/kaggle/input/qadataset/forensic_qa_dataset.json")
+
+with open(qa_path, 'r', encoding='utf-8') as f:
+    all_qa = json.load(f)
+
+# Sélection d'un sample de 300 QR
+sampled_qa = random.sample(all_qa, min(300, len(all_qa)))
+questions = [item["question"] for item in sampled_qa]
+ground_truths = [item["answer"] for item in sampled_qa]
+
+print(f"Q/R chargées : {len(questions)}")
+print(f"Exemple : {sampled_qa[0]}")
+#+end_src
+
+#+begin_src python
+# Construction de la base de connaissances
+pdf_folder = '/kaggle/input/forensic/'
+pdf_files = [os.path.join(pdf_folder, f) for f in os.listdir(pdf_folder) if f.lower().endswith('.pdf')]
+print(f"{len(pdf_files)} PDFs trouvés")
+
+def extract_text_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    text = ""
+    for page in doc:
+        text += page.get_text("text") + "\n\n"
+    doc.close()
+    return text.strip()
+
+all_text = ""
+for pdf in pdf_files:
+    all_text += f"\n\n-- {os.path.basename(pdf)} --\n\n" + extract_text_from_pdf(pdf)
+
+# Chunking
+def chunk_text(text, max_length=1200):
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        if len(current) + len(line) > max_length:
+            if current.strip():
+                chunks.append(current.strip())
+            current = line
+        else:
+            current += " " + line
+    if current.strip():
+        chunks.append(current.strip())
+    return [c for c in chunks if len(c) > 50]
+
+chunks = chunk_text(all_text)
+print(f"{len(chunks)} chunks créés (moy. {np.mean([len(c) for c in chunks]):.0f} car.)")
+#+end_src
+
+** Sélection du meilleur LLM
+
+#+begin_src python
+def load_model(model_name):
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name, max_seq_length=2048, dtype=None, load_in_4bit=True)
+    FastLanguageModel.for_inference(model)
+    return model, tokenizer
+
+def generate_response(model, tokenizer, question):
+    prompt = f"""Tu es un expert en digital forensics. Réponds UNIQUEMENT par la réponse courte exacte.
+
+Question : {question}
+
+Réponse :"""
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs, max_new_tokens=60, temperature=0.0,
+            do_sample=False, repetition_penalty=1.1,
+            eos_token_id=tokenizer.eos_token_id)
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return response.split("Réponse :")[-1].strip() if "Réponse :" in response else response.strip()
+#+end_src
+
+#+begin_src python
+# Nos trois LLMs de test
+models_to_test = {
+    "Gemma-2-9B": "unsloth/gemma-2-9b-it-bnb-4bit",
+    "Qwen2.5-7B": "unsloth/Qwen2.5-7B-Instruct-bnb-4bit",
+    "Llama-3.2-3B": "unsloth/Llama-3.2-3B-Instruct-bnb-4bit"
+}
+
+results = {}
+for name, path in models_to_test.items():
+    print(f"\n{'='*50}\n  Test de {name}\n{'='*50}")
+    model, tokenizer = load_model(path)
+    preds = [generate_response(model, tokenizer, q) for q in tqdm(questions, desc=name)]
+    results[name] = preds
+    del model, tokenizer; torch.cuda.empty_cache()
+#+end_src
+
+#+begin_src python
+# Fonctions d'évaluation
+def clean_response(text):
+    text = text.strip()
+    for p in ["La réponse est", "Il s'agit de", "C'est", "Réponse :", "L'outil est"]:
+        text = text.replace(p, "", 1).strip()
+    text = text.split('\n')[0].split('.')[0].strip()
+    return re.sub(r'`|\*|_', '', text).strip()
+
+def normalize(s):
+    s = re.sub(r'\b(a|an|the|le|la|les|un|une|des)\b', ' ', s.lower())
+    return ' '.join(re.sub(r'[^a-z0-9àâäéèêëïîôùûüÿç\s]', '', s).split()).strip()
+
+def f1_token(pred, gt):
+    p, g = normalize(pred).split(), normalize(gt).split()
+    common = sum((Counter(p) & Counter(g)).values())
+    if common == 0: return 0.0
+    prec, rec = common/max(len(p),1), common/max(len(g),1)
+    return 2*prec*rec/(prec+rec) if (prec+rec) > 0 else 0.0
+
+def compute_classic_metrics(predictions, ground_truths):
+    em, f1, rougeL = [], [], []
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    for p, gt in zip(predictions, ground_truths):
+        em.append(1 if normalize(p) == normalize(gt) else 0)
+        f1.append(f1_token(p, gt))
+        rougeL.append(scorer.score(gt, p)['rougeL'].fmeasure)
+    _, _, bert_f1 = bert_score_fn(predictions, ground_truths, lang="en", rescale_with_baseline=True)
+    return {"Exact Match": np.mean(em), "F1 Token": np.mean(f1),
+            "ROUGE-L": np.mean(rougeL), "BERTScore F1": bert_f1.mean().item()}
+#+end_src
+
+#+begin_src python
+# Nettoyage puis évaluation
+for name in results:
+    results[name] = [clean_response(p) for p in results[name]]
+
+scores = {name: compute_classic_metrics(preds, ground_truths) for name, preds in results.items()}
+df_scores = pd.DataFrame(scores).T.round(4)
+display(df_scores)
+
+best_model_name = df_scores["BERTScore F1"].idxmax()
+best_model_path = models_to_test[best_model_name]
+print(f"\n Meilleur modèle : {best_model_name}")
+#+end_src
+
+** Fine Tuning
+
+#+begin_src python
+from trl import SFTTrainer
+from transformers import TrainingArguments
+from datasets import Dataset
+
+ft_model, ft_tokenizer = FastLanguageModel.from_pretrained(
+    best_model_path, max_seq_length=2048, dtype=None, load_in_4bit=True)
+
+ft_model = FastLanguageModel.get_peft_model(
+    ft_model, r=32, lora_alpha=64, lora_dropout=0.05,
+    target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
+    bias="none", use_gradient_checkpointing="unsloth", random_state=SEED)
+
+trainable = sum(p.numel() for p in ft_model.parameters() if p.requires_grad)
+total = sum(p.numel() for p in ft_model.parameters())
+print(f"Params entraînables : {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+#+end_src
+
+#+begin_src python
+def fmt_ft(qa):
+    return f"### Instruction:\nTu es un expert en digital forensics.\n\n### Question:\n{qa['question']}\n\n### Réponse:\n{qa['answer']}"
+
+ft_ds = Dataset.from_dict({"text": [fmt_ft(qa) for qa in all_qa]})
+ft_split = ft_ds.train_test_split(test_size=0.1, seed=SEED)
+
+trainer = SFTTrainer(
+    model=ft_model, tokenizer=ft_tokenizer,
+    train_dataset=ft_split["train"], eval_dataset=ft_split["test"],
+    dataset_text_field="text", max_seq_length=2048, packing=True,
+    args=TrainingArguments(
+        output_dir="/kaggle/working/forensic-ft", num_train_epochs=3,
+        per_device_train_batch_size=4, gradient_accumulation_steps=4,
+        learning_rate=2e-4, warmup_ratio=0.05, weight_decay=0.01,
+        fp16=not torch.cuda.is_bf16_supported(), bf16=torch.cuda.is_bf16_supported(),
+        logging_steps=10, eval_strategy="epoch", save_strategy="epoch",
+        save_total_limit=2, load_best_model_at_end=True,
+        optim="adamw_8bit", lr_scheduler_type="cosine", seed=SEED, report_to="none",
+        average_tokens_across_devices=False))
+
+stats = trainer.train()
+print(f"Fine-tuning terminé — loss : {stats.training_loss:.4f}")
+ft_model.save_pretrained("/kaggle/working/forensic-adapter")
+ft_tokenizer.save_pretrained("/kaggle/working/forensic-adapter")
+#+end_src
+
+#+begin_src python
+# Prédictions du modèle fine-tuné (sans RAG)
+FastLanguageModel.for_inference(ft_model)
+ft_preds = [clean_response(generate_response(ft_model, ft_tokenizer, q)) for q in tqdm(questions, desc="FT")]
+#+end_src
+** RAG avec ChromaDB
+
+#+begin_src python
+# Construction de la collection ChromaDB
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
+# Embedding function multilingue
+embedding_fn = SentenceTransformerEmbeddingFunction(
+    model_name="paraphrase-multilingual-mpnet-base-v2")
+
+# Client ChromaDB persistant
+chroma_client = chromadb.PersistentClient(path="/kaggle/working/chromadb")
+
+# Supprimer s'il existe déjà 
+try:
+    chroma_client.delete_collection("forensic_chunks")
+except:
+    pass
+
+collection = chroma_client.create_collection(
+    name="forensic_chunks",
+    embedding_function=embedding_fn,
+    metadata={"hnsw:space": "cosine"}
+)
+
+# Ajout des chunks par batch de 500
+BATCH_SIZE = 500
+for i in range(0, len(chunks), BATCH_SIZE):
+    batch = chunks[i:i+BATCH_SIZE]
+    collection.add(
+        documents=batch,
+        ids=[f"chunk_{j}" for j in range(i, i+len(batch))],
+        metadatas=[{"source": "forensic_corpus", "index": j} for j in range(i, i+len(batch))]
+    )
+
+print(f"ChromaDB : {collection.count()} chunks indexés")
+#+end_src
+
+#+begin_src python
+# Fonction de RAG simple via ChromaDB
+def rag_generate(question, model, tokenizer, top_k=3):
+    # Retrieval ChromaDB
+    results = collection.query(query_texts=[question], n_results=top_k)
+    retrieved = results["documents"][0]
+    context = "\n\n".join(retrieved)
+
+    prompt = f"""Tu es un expert en digital forensics. Utilise UNIQUEMENT les informations suivantes.
+
+Contexte :
+{context}
+
+Question : {question}
+
+Réponse courte et exacte :
+Réponse :"""
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    with torch.no_grad():
+        outputs = model.generate(
+            ,**inputs, max_new_tokens=60, temperature=0.0,
+            do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    answer = response.split("Réponse :")[-1].strip() if "Réponse :" in response else response.strip()
+    return answer, retrieved
+#+end_src
+
+#+begin_src python
+# Prédictions RAG Simple
+rag_model, rag_tokenizer = load_model(best_model_path)
+
+rag_simple_preds, rag_simple_ctx = [], []
+for q in tqdm(questions, desc="RAG Simple (ChromaDB)"):
+    ans, ctx = rag_generate(q, rag_model, rag_tokenizer, top_k=3)
+    rag_simple_preds.append(ans)
+    rag_simple_ctx.append(ctx)
+
+rag_simple_clean = [clean_response(p) for p in rag_simple_preds]
+print(f"RAG Simple : {len(rag_simple_clean)} prédictions")
+#+end_src
+
+** Optimisation du RAG
+*** Par Reranking :
+
+#+begin_src python
+reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device='cuda')
+
+# Fonction de RAG avec reranking et sélection du top apres cross encoding
+def rag_rerank(question, model, tokenizer, top_k_retrieve=10, top_k_final=3):
+
+    results = collection.query(query_texts=[question], n_results=top_k_retrieve)
+    candidates = results["documents"][0]
+
+    pairs = [[question, c] for c in candidates]
+    scores = reranker.predict(pairs)
+    top_idx = np.argsort(scores)[::-1][:top_k_final]
+    retrieved = [candidates[i] for i in top_idx]
+    context = "\n\n".join(retrieved)
+
+    prompt = f"""Tu es un expert en digital forensics. Utilise UNIQUEMENT les informations suivantes.
+
+Contexte (reranké) :
+{context}
+
+Question : {question}
+
+Réponse courte et exacte :
+Réponse :"""
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    with torch.no_grad():
+        outputs = model.generate(
+            ,**inputs, max_new_tokens=60, temperature=0.0,
+            do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    answer = response.split("Réponse :")[-1].strip() if "Réponse :" in response else response.strip()
+    return answer, retrieved
+#+end_src
+
+*** Par Hybrid Search :
+
+#+begin_src python
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine
+
+# Index TF-IDF (sparse)
+tfidf = TfidfVectorizer(max_features=10000, sublinear_tf=True)
+tfidf_matrix = tfidf.fit_transform(chunks)
+print(f"TF-IDF : {tfidf_matrix.shape}")
+
+# Fonction de rag hybrid 
+def rag_hybrid(question, model, tokenizer, top_k=3):
+ 
+    # Dense via ChromaDB
+    chroma_res = collection.query(query_texts=[question], n_results=top_k*3,
+                                  include=["documents", "metadatas"])
+    dense_indices = [m["index"] for m in chroma_res["metadatas"][0]]
+
+    # Sparse via TF-IDF
+    q_tfidf = tfidf.transform([question])
+    sparse_scores = sklearn_cosine(q_tfidf, tfidf_matrix).flatten()
+    sparse_top = np.argsort(sparse_scores)[::-1][:top_k*3].tolist()
+
+    # Reciprocal Rank Fusion
+    k_rrf = 60
+    rrf = {}
+    for rank, idx in enumerate(dense_indices):
+        rrf[idx] = rrf.get(idx, 0) + 1.0 / (k_rrf + rank + 1)
+    for rank, idx in enumerate(sparse_top):
+        rrf[idx] = rrf.get(idx, 0) + 1.0 / (k_rrf + rank + 1)
+
+    top_indices = [i for i, _ in sorted(rrf.items(), key=lambda x: x[1], reverse=True)[:top_k*2]]
+
+    # Reranking final
+    pairs = [[question, chunks[i]] for i in top_indices]
+    scores = reranker.predict(pairs)
+    final_idx = np.argsort(scores)[::-1][:top_k]
+    retrieved = [chunks[top_indices[i]] for i in final_idx]
+    context = "\n\n".join(retrieved)
+
+    prompt = f"""Tu es un expert en digital forensics. Utilise UNIQUEMENT les informations suivantes.
+
+Contexte (recherche hybride) :
+{context}
+
+Question : {question}
+
+Réponse courte et exacte :
+Réponse :"""
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    with torch.no_grad():
+        outputs = model.generate(
+            ,**inputs, max_new_tokens=60, temperature=0.0,
+            do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    answer = response.split("Réponse :")[-1].strip() if "Réponse :" in response else response.strip()
+    return answer, retrieved
+#+end_src
+
+#+begin_src python
+#  Toutes les prédictions RAG
+rag_rerank_preds, rag_rerank_ctx = [], []
+for q in tqdm(questions, desc="RAG Reranking"):
+    a, c = rag_rerank(q, rag_model, rag_tokenizer); rag_rerank_preds.append(a); rag_rerank_ctx.append(c)
+rag_rerank_clean = [clean_response(p) for p in rag_rerank_preds]
+
+rag_hybrid_preds, rag_hybrid_ctx = [], []
+for q in tqdm(questions, desc="RAG Hybrid"):
+    a, c = rag_hybrid(q, rag_model, rag_tokenizer); rag_hybrid_preds.append(a); rag_hybrid_ctx.append(c)
+rag_hybrid_clean = [clean_response(p) for p in rag_hybrid_preds]
+
+# RAG Hybrid avec modèle fine-tuné
+rag_ft_preds, rag_ft_ctx = [], []
+for q in tqdm(questions, desc="RAG Hybrid + FT"):
+    a, c = rag_hybrid(q, ft_model, ft_tokenizer); rag_ft_preds.append(a); rag_ft_ctx.append(c)
+rag_ft_clean = [clean_response(p) for p in rag_ft_preds]
+
+del rag_model, rag_tokenizer; torch.cuda.empty_cache()
+print("Toutes les prédictions RAG générées.")
+#+end_src
+
+** CheckPoint (optionnel)
+*** Capture du checkpoint
+#+begin_src python
+# SAUVEGARDE CHECKPOINT (à exécuter avant de mettre fin à la session)
+# Télécharge tout ce qu'il faut pour reprendre sans réentraîner
+
+import shutil, pickle
+
+CKPT = '/kaggle/working/checkpoint'
+os.makedirs(CKPT, exist_ok=True)
+
+# Adapter fine-tuné
+if os.path.exists('/kaggle/working/forensic-adapter'):
+    shutil.copytree('/kaggle/working/forensic-adapter', f'{CKPT}/forensic-adapter', dirs_exist_ok=True)
+    print(' Adapter fine-tuné sauvegardé')
+
+#  ChromaDB (base vectorielle persistante)
+if os.path.exists('/kaggle/working/chromadb'):
+    shutil.copytree('/kaggle/working/chromadb', f'{CKPT}/chromadb', dirs_exist_ok=True)
+    print(' ChromaDB sauvegardée')
+
+#  Toutes les prédictions et contextes
+predictions = {
+    'best_model_name': best_model_name,
+    'best_model_path': best_model_path,
+    'questions': questions,
+    'ground_truths': ground_truths,
+    'chunks': chunks,
+    # Prédictions LLM
+    'results': results,        
+    'scores': scores,         
+    'ft_preds': ft_preds,
+    # Prédictions RAG + contextes
+    'rag_simple_clean': rag_simple_clean,
+    'rag_simple_ctx': rag_simple_ctx,
+    'rag_rerank_clean': rag_rerank_clean,
+    'rag_rerank_ctx': rag_rerank_ctx,
+    'rag_hybrid_clean': rag_hybrid_clean,
+    'rag_hybrid_ctx': rag_hybrid_ctx,
+    'rag_ft_clean': rag_ft_clean,
+    'rag_ft_ctx': rag_ft_ctx,
+}
+with open(f'{CKPT}/predictions.pkl', 'wb') as f:
+    pickle.dump(predictions, f)
+print(' Prédictions sauvegardées')
+
+#  TF-IDF (pour le hybrid search de l'agent)
+with open(f'{CKPT}/tfidf.pkl', 'wb') as f:
+    pickle.dump({'tfidf': tfidf, 'tfidf_matrix': tfidf_matrix}, f)
+print(' TF-IDF sauvegardé')
+
+# Et zipper le tout pour téléchargement
+shutil.make_archive('/kaggle/working/checkpoint_all', 'zip', CKPT)
+print(f'\n CHECKPOINT PRÊT : /kaggle/working/checkpoint_all.zip')
+print(f'  Taille : {os.path.getsize("/kaggle/working/checkpoint_all.zip")/1e6:.1f} MB')
+print(f'\n Téléchargez ce fichier, puis uploadez-le en input dans un nouveau notebook')
+print(f'  pour reprendre directement à l\'évaluation.')
+#+end_src
+
+*** Restauration
+#+begin_src python
+# CHARGEMENT CHECKPOINT (à exécuter pour reprendre l'évaluation)
+# (si vous avez coupé le runtime et uploadé le zip en input)     ║
+
+import os, re, json, pickle, shutil, random
+import numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+from collections import Counter
+from IPython.display import display
+from rouge_score import rouge_scorer
+from bert_score import score as bert_score_fn
+from sentence_transformers import CrossEncoder
+from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine
+import chromadb
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
+# Trouver le checkpoint
+CKPT_ZIP = None
+for root, dirs, files in os.walk('/kaggle/input'):
+    for f in files:
+        if f == 'checkpoint_all.zip':
+            CKPT_ZIP = os.path.join(root, f)
+            break
+
+if CKPT_ZIP:
+    print(f'Checkpoint trouvé : {CKPT_ZIP}')
+    shutil.unpack_archive(CKPT_ZIP, '/kaggle/working/checkpoint')
+    CKPT = '/kaggle/working/checkpoint'
+elif os.path.exists('/kaggle/working/checkpoint/predictions.pkl'):
+    CKPT = '/kaggle/working/checkpoint'
+    print('Checkpoint local trouvé.')
+else:
+    raise FileNotFoundError('Pas de checkpoint ! Uploadez checkpoint_all.zip en input.')
+
+# Restaurer les prédictions
+with open(f'{CKPT}/predictions.pkl', 'rb') as f:
+    data = pickle.load(f)
+
+best_model_name = data['best_model_name']
+best_model_path = data['best_model_path']
+questions = data['questions']
+ground_truths = data['ground_truths']
+chunks = data['chunks']
+results = data['results']
+scores = data['scores']
+ft_preds = data['ft_preds']
+rag_simple_clean = data['rag_simple_clean']
+rag_simple_ctx = data['rag_simple_ctx']
+rag_rerank_clean = data['rag_rerank_clean']
+rag_rerank_ctx = data['rag_rerank_ctx']
+rag_hybrid_clean = data['rag_hybrid_clean']
+rag_hybrid_ctx = data['rag_hybrid_ctx']
+rag_ft_clean = data['rag_ft_clean']
+rag_ft_ctx = data['rag_ft_ctx']
+print(f' Prédictions restaurées — {len(questions)} questions, meilleur modèle : {best_model_name}')
+
+# Restaurer TF-IDF
+with open(f'{CKPT}/tfidf.pkl', 'rb') as f:
+    tfidf_data = pickle.load(f)
+tfidf = tfidf_data['tfidf']
+tfidf_matrix = tfidf_data['tfidf_matrix']
+print(' TF-IDF restauré')
+
+#  Restaurer ChromaDB
+if os.path.exists(f'{CKPT}/chromadb'):
+    shutil.copytree(f'{CKPT}/chromadb', '/kaggle/working/chromadb', dirs_exist_ok=True)
+embedding_fn = SentenceTransformerEmbeddingFunction(model_name='paraphrase-multilingual-mpnet-base-v2')
+chroma_client = chromadb.PersistentClient(path='/kaggle/working/chromadb')
+collection = chroma_client.get_collection('forensic_chunks', embedding_function=embedding_fn)
+print(f' ChromaDB restaurée — {collection.count()} chunks')
+
+# ── Restaurer reranker 
+reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device='cuda')
+print(' Cross-encoder chargé')
+
+# Fonctions utilitaires
+def clean_response(text):
+    text = text.strip()
+    for p in ['La réponse est', "Il s'agit de", "C'est", 'Réponse :', "L'outil est"]:
+        text = text.replace(p, '', 1).strip()
+    text = text.split('\n')[0].split('.')[0].strip()
+    return re.sub(r'`|\*|_', '', text).strip()
+
+def normalize(s):
+    s = re.sub(r'\b(a|an|the|le|la|les|un|une|des)\b', ' ', s.lower())
+    return ' '.join(re.sub(r'[^a-z0-9àâäéèêëïîôùûüÿç\s]', '', s).split()).strip()
+
+def f1_token(pred, gt):
+    p, g = normalize(pred).split(), normalize(gt).split()
+    common = sum((Counter(p) & Counter(g)).values())
+    if common == 0: return 0.0
+    prec, rec = common/max(len(p),1), common/max(len(g),1)
+    return 2*prec*rec/(prec+rec) if (prec+rec) > 0 else 0.0
+
+def compute_classic_metrics(predictions, ground_truths):
+    em, f1, rougeL = [], [], []
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    for p, gt in zip(predictions, ground_truths):
+        em.append(1 if normalize(p) == normalize(gt) else 0)
+        f1.append(f1_token(p, gt))
+        rougeL.append(scorer.score(gt, p)['rougeL'].fmeasure)
+    _, _, bert_f1 = bert_score_fn(predictions, ground_truths, lang='en', rescale_with_baseline=True)
+    return {'Exact Match': np.mean(em), 'F1 Token': np.mean(f1),
+            'ROUGE-L': np.mean(rougeL), 'BERTScore F1': bert_f1.mean().item()}
+
+WEIGHTS = {'Exact Match': 0.15, 'F1 Token': 0.25, 'ROUGE-L': 0.25, 'BERTScore F1': 0.35}
+def composite_score(metrics): return sum(WEIGHTS[k]*metrics[k] for k in WEIGHTS)
+
+models_to_test = {
+    'Gemma-2-9B': 'unsloth/gemma-2-9b-it-bnb-4bit',
+    'Qwen2.5-7B': 'unsloth/Qwen2.5-7B-Instruct-bnb-4bit',
+    'Llama-3.2-3B': 'unsloth/Llama-3.2-3B-Instruct-bnb-4bit'}
+
+print('\n Checkpoint restauré — prêt pour l\'évaluation !')
+#+end_src
+
