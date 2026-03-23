@@ -197,6 +197,14 @@ best_model_path = models_to_test[best_model_name]
 print(f"\n Meilleur modèle : {best_model_name}")
 #+end_src
 
+| LLMs       | Exact Match | F1 Token | Rouge-L | BertScore F1 |
+|------------+-------------+----------+---------+--------------|
+| Gemma-2-9B |         0.0 |   0.1635 |  0.1581 |       0.4286 |
+|------------+-------------+----------+---------+--------------|
+| Qwen2.5-7B |         0.0 |   0.1243 |  0.1167 |       0.3955 |
+|------------+-------------+----------+---------+--------------|
+| Llama-3.2-3B | 0.0         | 0.0910   | 0.0946  | 0.3424       |
+
 ** Fine Tuning
 
 #+begin_src python
@@ -623,3 +631,250 @@ models_to_test = {
 print('\n Checkpoint restauré — prêt pour l\'évaluation !')
 #+end_src
 
+** Evaluation
+
+#+begin_src python
+#  API Groq key
+GROQ_KEY = UserSecretsClient().get_secret("ragroq")
+groq_client = Groq(api_key=GROQ_KEY)
+sim_model = SentenceTransformer("all-MiniLM-L6-v2")
+#+end_src
+
+
+#+begin_src python
+def groq_faithfulness_batch(questions, answers, contexts):
+    n = len(questions)
+    prompt = "You are evaluating a Retrieval Augmented Generation system.\n\n"
+    for i, (q, a, c) in enumerate(zip(questions, answers, contexts)):
+        prompt += (
+            f"Example {i+1}:\n"
+            f"Question:\n{q}\n"
+            f"Retrieved Context:\n{c[:300]}\n"
+            f"Answer:\n{a[:300]}\n"
+            f"Score the faithfulness between 0 and 1. Return ONLY the number, one per line.\n\n"
+        )
+    response = groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=20 * n,   
+        temperature=0.0
+    )
+    raw = response.choices[0].message.content.strip()
+    
+    scores = []
+    for line in raw.splitlines():
+        line = line.strip()
+        
+        match = re.search(r'(\d+\.?\d*)', line)
+        if match:
+            val = float(match.group(1))
+            if 0.0 <= val <= 1.0:
+                scores.append(val)
+    
+    # Fallback si toujours pas assez de scores
+    while len(scores) < n:
+        scores.append(float('nan'))
+    
+    return scores[:n]
+
+def groq_relevance_batch(questions, answers):
+    n = len(questions)
+    prompt = "You are evaluating a RAG system.\n\n"
+    for i, (q, a) in enumerate(zip(questions, answers)):
+        prompt += (
+            f"Example {i+1}:\n"
+            f"Question:\n{q}\n"
+            f"Answer:\n{a[:300]}\n"
+            f"Score the relevance of the answer to the question between 0 and 1. "
+            f"Return ONLY the number, one per line.\n\n"
+        )
+    response = groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=20 * n,
+        temperature=0.0
+    )
+    raw = response.choices[0].message.content.strip()
+    
+    scores = []
+    for line in raw.splitlines():
+        line = line.strip()
+        match = re.search(r'(\d+\.?\d*)', line)
+        if match:
+            val = float(match.group(1))
+            if 0.0 <= val <= 1.0:
+                scores.append(val)
+    
+    while len(scores) < n:
+        scores.append(float('nan'))
+    
+    return scores[:n]
+
+# ── Cosine Similarity ──
+def cosine_sim_score(answers, ground_truths):
+    emb_a = sim_model.encode(answers)
+    emb_g = sim_model.encode(ground_truths)
+    sims = [
+        float(np.dot(a, g) / (np.linalg.norm(a) * np.linalg.norm(g)))
+        for a, g in zip(emb_a, emb_g)
+    ]
+    return np.mean(sims)
+
+# ── Paramètres ──
+RAG_SAMPLE = 15
+sample_idx = random.sample(range(len(questions)), min(RAG_SAMPLE, len(questions)))
+
+rag_configs = [
+    ('RAG Simple',    rag_simple_clean,  rag_simple_ctx),
+    ('RAG Reranking', rag_rerank_clean,  rag_rerank_ctx),
+    ('RAG Hybrid',    rag_hybrid_clean,  rag_hybrid_ctx),
+    ('RAG Hybrid+FT', rag_ft_clean,      rag_ft_ctx),
+]
+
+results = {}
+#+end_src
+
+#+begin_src python
+# ── Boucle d'évaluation ──
+for name, ans, ctx in rag_configs:
+    print(f'\n{"─"*50}\n{name}\n{"─"*50}')
+
+    s_ans = [ans[i] for i in sample_idx]
+    s_ctx = [ctx[i] for i in sample_idx]
+    s_q   = [questions[i] for i in sample_idx]
+    s_gt  = [ground_truths[i] for i in sample_idx]
+
+    # Cosine Similarity
+    cos = cosine_sim_score(s_ans, s_gt)
+    print(f"  Cosine Similarity : {cos:.4f}")
+
+    # Faithfulness
+    faith_scores = groq_faithfulness_batch(s_q, s_ans, s_ctx)
+    faithfulness = np.nanmean(faith_scores) if faith_scores else float('nan')
+    print(f"  Faithfulness      : {faithfulness:.4f}")
+
+    # Answer Relevance
+    rel_scores = groq_relevance_batch(s_q, s_ans)
+    relevance = np.nanmean(rel_scores) if rel_scores else float('nan')
+    print(f"  Answer Relevance  : {relevance:.4f}")
+
+    results[name] = {
+        "Cosine Similarity": round(cos, 4),
+        "Faithfulness":      round(faithfulness, 4),
+        "Answer Relevance":  round(relevance, 4),
+    }
+# ── Tableau final ──
+df_results = pd.DataFrame(results).T
+df_results["Mean Score"] = df_results.mean(axis=1).round(4)
+df_results = df_results.sort_values("Mean Score", ascending=False)
+
+print("\n" + "═"*60)
+print("         RÉSULTATS COMPARATIFS RAG")
+print("═"*60)
+display(df_results.style
+    .background_gradient(cmap="RdYlGn", axis=0)
+    .format("{:.4f}")
+    .set_caption("Évaluation RAG — Groq (llama-3.1-8b-instant)")
+)
+
+# ── Meilleur modèle ──
+best = df_results["Mean Score"].idxmax()
+print(f"\n Meilleur pipeline : {best} (Mean Score: {df_results.loc[best, 'Mean Score']})")
+#+end_src
+
+| Methodes      | Cosine Similarity | Faithfulness | Answer Relevance | Mean Score |
+|---------------+-------------------+--------------+------------------+------------|---------------+-------------------+--------------+------------------+------------|
+| RAG Hybrid+FT |            0.7780 |       0.5333 |           0.6071 |     0.6395 |
+|---------------+-------------------+--------------+------------------+------------|
+| RAG Reranking |            0.5513 |       0.5600 |           0.6933 |     0.6015 |
+|---------------+-------------------+--------------+------------------+------------|
+| RAG Hybrid    |            0.5550 |       0.5333 |           0.6000 |     0.5628 |
+|---------------+-------------------+--------------+------------------+------------|
+| RAG Simple    | 0.3672            | 0.5600       | 0.3500           |  0.4257    |
+
+Meilleur pipeline : RAG Hybrid+FT (Mean Score : 0.6395)
+** Comparaison
+
+#+begin_src python
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+from matplotlib.patches import FancyBboxPatch
+
+# ── Palette ──
+palette = ['#378ADD', '#1D9E75', '#D85A30', '#7F77DD']
+pipeline_names = list(df_results.index)
+metrics = ['Cosine Similarity', 'Faithfulness', 'Answer Relevance', 'Mean Score']
+
+fig = plt.figure(figsize=(20, 8))
+fig.patch.set_facecolor('#FAFAFA')
+
+ax1 = fig.add_subplot(1, 2, 1)
+ax1.set_facecolor('#FAFAFA')
+
+n_metrics   = len(metrics)
+n_pipelines = len(pipeline_names)
+x           = np.arange(n_metrics)
+width       = 0.18
+offsets     = np.linspace(-(n_pipelines-1)/2, (n_pipelines-1)/2, n_pipelines) * width
+
+for i, (name, color) in enumerate(zip(pipeline_names, palette)):
+    vals = [df_results.loc[name, m] for m in metrics]
+    bars = ax1.bar(x + offsets[i], vals, width=width,
+                   color=color, alpha=0.85, label=name,
+                   edgecolor='white', linewidth=0.5, zorder=3)
+    for bar, val in zip(bars, vals):
+        if not np.isnan(val):
+            ax1.text(bar.get_x() + bar.get_width()/2,
+                     bar.get_height() + 0.015,
+                     f'{val:.2f}', ha='center', va='bottom',
+                     fontsize=6.5, color=color, fontweight='bold')
+
+ax1.set_xticks(x)
+ax1.set_xticklabels([m.replace(' ', '\n') for m in metrics], fontsize=9)
+ax1.set_ylim(0, 1.15)
+ax1.set_ylabel('Score', fontsize=10)
+ax1.set_title('Métriques par pipeline RAG', fontsize=12, fontweight='bold', pad=12)
+ax1.yaxis.grid(True, linestyle='--', alpha=0.4, zorder=0)
+ax1.set_axisbelow(True)
+ax1.spines[['top', 'right']].set_visible(False)
+ax1.legend(loc='upper right', fontsize=8, framealpha=0.6,
+           edgecolor='#cccccc', bbox_to_anchor=(1, 1.02))
+
+
+ax2 = fig.add_subplot(1, 2, 2, polar=True)
+ax2.set_facecolor('#FAFAFA')
+
+angles = np.linspace(0, 2 * np.pi, n_metrics, endpoint=False).tolist()
+angles += angles[:1]  # ferme le polygone
+
+for i, (name, color) in enumerate(zip(pipeline_names, palette)):
+    vals = [df_results.loc[name, m] for m in metrics]
+    # Remplace NaN par 0 pour l'affichage
+    vals = [0 if np.isnan(v) else v for v in vals]
+    vals += vals[:1]
+    ax2.plot(angles, vals, 'o-', lw=2, label=name, color=color, markersize=5)
+    ax2.fill(angles, vals, alpha=0.08, color=color)
+
+ax2.set_xticks(angles[:-1])
+ax2.set_xticklabels([m.replace(' ', '\n') for m in metrics], fontsize=9)
+ax2.set_ylim(0, 1)
+ax2.set_yticks([0.25, 0.50, 0.75, 1.00])
+ax2.set_yticklabels(['0.25', '0.50', '0.75', '1.00'], fontsize=7, color='gray')
+ax2.yaxis.grid(True, linestyle='--', alpha=0.3)
+ax2.xaxis.grid(True, linestyle='--', alpha=0.3)
+ax2.spines['polar'].set_visible(False)
+ax2.set_title('Radar — comparaison globale', fontsize=12,
+              fontweight='bold', pad=20)
+ax2.legend(loc='upper right', bbox_to_anchor=(1.35, 1.15),
+           fontsize=8, framealpha=0.6, edgecolor='#cccccc')
+
+plt.suptitle('Évaluation RAG — Groq (llama-3.1-8b-instant)',
+             fontsize=14, fontweight='bold', y=1.02, color='#333333')
+plt.tight_layout()
+plt.savefig("benchmark_rag.png", dpi=150, bbox_inches='tight',
+            facecolor='#FAFAFA')
+plt.show()
+print(" Graphique sauvegardé : benchmark_rag.png")
+#+end_src
+[[file:Metriques/RagBench.png]]
