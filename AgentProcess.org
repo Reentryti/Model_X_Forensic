@@ -1,0 +1,298 @@
+#+title: Partie 3 : Agentic AI
+* Objectives
+Agent pour une recherche web : quand le modéle n'est pas sur de la réponse, qu'il fasse une recherche internet pour compléter ou vérifier
+* Pipeline
+** Test de recherche
+
+#+begin_src python
+!pip install -q ddgs
+from ddgs import DDGS
+
+# Search with DuckDuckGo Web
+def web_search(query: str, max_results: int = 3) -> str:
+ 
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        snippets = [r.get('body', '') for r in results if r.get('body')]
+        return '\n'.join(snippets) if snippets else ''
+    except Exception as e:
+        print(f'  [WebSearch] Erreur : {e}')
+        return ''
+
+# Test
+print(web_search('linux forensics volatility', max_results=1)[:200])
+#+end_src
+** Parametres
+
+#+begin_src python
+from typing import TypedDict, List, Literal, Annotated
+from langgraph.graph import StateGraph, START, END
+
+# State agents
+class MultiAgentState(TypedDict):
+    question: str
+    local_contexts: List[str]
+    web_contexts: List[str]
+    confidence: float
+    context_sufficient: bool
+    answer: str
+    source: str           
+    retry_count: int
+
+MAX_RETRIES = 1
+CONFIDENCE_THRESHOLD = 0.3
+print('State multi-agent défini.')
+#+end_src
+** Retriver Agent
+
+#+begin_src python
+# AGENT 1  RETRIEVER — hybrid search
+
+def retriever_agent(state: MultiAgentState) -> MultiAgentState:
+    question = state['question']
+    print(f'  [Retriever] Recherche pour : "{question[:60]}..."')
+
+    # Dense (ChromaDB)
+    chroma_res = collection.query(
+        query_texts=[question], n_results=9, include=['documents', 'metadatas'])
+    dense_indices = [m['index'] for m in chroma_res['metadatas'][0]]
+
+    # Sparse (TF-IDF)
+    q_tfidf = tfidf.transform([question])
+    sparse_scores = sklearn_cosine(q_tfidf, tfidf_matrix).flatten()
+    sparse_top = np.argsort(sparse_scores)[::-1][:9].tolist()
+
+    # RRF
+    rrf = {}
+    for rank, idx in enumerate(dense_indices):
+        rrf[idx] = rrf.get(idx, 0) + 1.0/(60+rank+1)
+    for rank, idx in enumerate(sparse_top):
+        rrf[idx] = rrf.get(idx, 0) + 1.0/(60+rank+1)
+    top = [i for i, _ in sorted(rrf.items(), key=lambda x: x[1], reverse=True)[:6]]
+
+    # Reranking
+    pairs = [[question, chunks[i]] for i in top]
+    scores = reranker.predict(pairs)
+    best_idx = np.argsort(scores)[::-1][:3]
+
+    state['local_contexts'] = [chunks[top[i]] for i in best_idx]
+    state['confidence'] = float(np.mean(scores[best_idx]))
+    print(f'  [Retriever] {len(state["local_contexts"])} chunks, confiance={state["confidence"]:.3f}')
+    return state
+#+end_src
+** Validator Agent
+
+#+begin_src python
+# AGENT 2 VALIDATEUR — evaluate context quality
+def validator_agent(state: MultiAgentState) -> MultiAgentState:
+    
+    conf = state['confidence']
+    has_content = any(len(c.strip()) > 20 for c in state['local_contexts'])
+
+    if conf >= CONFIDENCE_THRESHOLD and has_content:
+        state['context_sufficient'] = True
+        print(f'  [Validateur]  Contexte suffisant (conf={conf:.3f})')
+    else:
+        state['context_sufficient'] = False
+        print(f'  [Validateur]  Contexte insuffisant (conf={conf:.3f}) → web search')
+    return state
+
+def route_after_validation(state: MultiAgentState) -> Literal['generator_agent', 'web_search_agent']:
+    if state['context_sufficient']:
+        return 'generator_agent'
+    if state['retry_count'] >= MAX_RETRIES:
+        print(f'  [Validateur] Max retries atteint → génération avec ce qu\'on a')
+        return 'generator_agent'
+    return 'web_search_agent'
+#+end_src
+** Web Search Agent
+
+#+begin_src python
+# AGENT 3  WEB SEARCH 
+def web_search_agent(state: MultiAgentState) -> MultiAgentState:
+    query = state['question'] + ' digital forensics'
+    print(f'  [WebSearch] Recherche : "{query[:60]}..."')
+
+    web_text = web_search(query, max_results=3)
+    if web_text:
+        state['web_contexts'] = [web_text]
+        state['source'] = 'fused'
+        print(f'  [WebSearch] {len(web_text)} caractères récupérés')
+    else:
+        state['web_contexts'] = []
+        print('  [WebSearch] Aucun résultat')
+
+    state['retry_count'] = state.get('retry_count', 0) + 1
+    return state
+#+end_src
+** Generator Agent
+
+#+begin_src python
+# AGENT 4  GENERATEUR — give final response
+
+def generator_agent(state: MultiAgentState) -> MultiAgentState:
+    local = '\n\n'.join(state['local_contexts'])[:600]
+    web = '\n\n'.join(state['web_contexts'])[:400] if state['web_contexts'] else ''
+
+    if web:
+        prompt = f"""Tu es un expert en digital forensics.
+Tu as deux sources. Utilise-les pour répondre.
+
+=== Base de connaissances ===
+{local}
+
+=== Recherche web ===
+{web}
+
+Question : {state['question']}
+Réponse courte et exacte :
+Réponse :"""
+        state['source'] = 'fused'
+    else:
+        prompt = f"""Tu es un expert en digital forensics. Utilise UNIQUEMENT le contexte.
+
+Contexte :
+{local}
+
+Question : {state['question']}
+Réponse courte et exacte :
+Réponse :"""
+        state['source'] = 'local'
+
+    inputs = ft_tokenizer(
+        prompt, return_tensors='pt',
+        truncation=True, max_length=480
+    ).to('cuda')
+
+    with torch.no_grad():
+        outputs = ft_model.generate(
+            **inputs, max_new_tokens=60,
+            do_sample=False, temperature=0.0,
+            pad_token_id=ft_tokenizer.eos_token_id)
+
+    resp = ft_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    state['answer'] = resp.split('Réponse :')[-1].strip() if 'Réponse :' in resp else resp.strip()
+    print(f'  [Générateur] ({state["source"]}) → "{state["answer"][:80]}"')
+    return state
+#+end_src
+
+** Evaluation
+#+begin_src python
+# GRAPHE MULTI-AGENT
+
+workflow = StateGraph(MultiAgentState)
+
+# Ajout des 4 agents
+workflow.add_node('retriever_agent', retriever_agent)
+workflow.add_node('validator_agent', validator_agent)
+workflow.add_node('web_search_agent', web_search_agent)
+workflow.add_node('generator_agent', generator_agent)
+
+# Flux : START → Retriever → Validateur → (Generator | WebSearch → Generator)
+workflow.add_edge(START, 'retriever_agent')
+workflow.add_edge('retriever_agent', 'validator_agent')
+workflow.add_conditional_edges('validator_agent', route_after_validation, {
+    'generator_agent': 'generator_agent',
+    'web_search_agent': 'web_search_agent'})
+workflow.add_edge('web_search_agent', 'generator_agent')
+workflow.add_edge('generator_agent', END)
+
+multi_agent = workflow.compile()
+print('Système multi-agent compilé (4 agents) !')
+#+end_src
+
+#+begin_src python
+# ── Évaluation multi-agent sur tout le dataset ──
+agent_preds, agent_ctx, agent_sources = [], [], []
+
+for q in tqdm(questions, desc='Multi-Agent'):
+    result = multi_agent.invoke({
+        'question': q, 'local_contexts': [], 'web_contexts': [],
+        'confidence': 0.0, 'context_sufficient': False,
+        'answer': '', 'source': '', 'retry_count': 0})
+    agent_preds.append(result['answer'])
+    agent_ctx.append(result['local_contexts'] + result['web_contexts'])
+    agent_sources.append(result['source'])
+
+agent_clean = [clean_response(p) for p in agent_preds]
+agent_classic = compute_classic_metrics(agent_clean, ground_truths)
+
+# Stats
+from collections import Counter as Ctr
+src_counts = Ctr(agent_sources)
+print(f'\nSources utilisées : {dict(src_counts)}')
+print(f'Web déclenché : {src_counts.get("fused",0)}/{len(questions)} ({100*src_counts.get("fused",0)/len(questions):.1f}%)')
+print(f'Scores Multi-Agent : {agent_classic}')
+#+end_src
+
+| Methodes      | Cosine Similarity | Faithfulness | Answer Relevance | Mean Score |
+|---------------+-------------------+--------------+------------------+------------|
+| Multi-Agent   |            0.7629 |       0.8400 |           0.7000 |     0.7676 |
+|---------------+-------------------+--------------+------------------+------------|
+| RAG Hybrid+FT |            0.7780 |       0.5333 |           0.6071 |     0.6395 |
+|---------------+-------------------+--------------+------------------+------------|
+| RAG Reranking |            0.5513 |       0.5600 |           0.6933 |     0.6015 |
+|---------------+-------------------+--------------+------------------+------------|
+| RAG Hybrid    |            0.5550 |       0.5333 |           0.6000 |     0.5628 |
+|---------------+-------------------+--------------+------------------+------------|
+| RAG Simple    | 0.3672            | 0.5600       | 0.3500           |  0.4257    |
+
+** Comparaison
+#+begin_src python
+# ── Comparaison finale avec le Multi-Agent ──
+# Ajouter aux résultats existants
+results_final = dict(results) if isinstance(results, dict) else {}
+
+# Évaluation multi-agent avec Groq
+sample_idx_agent = random.sample(range(len(questions)), min(5, len(questions)))
+s_ans = [agent_clean[i] for i in sample_idx_agent]
+s_ctx = [agent_ctx[i] for i in sample_idx_agent]
+s_q   = [questions[i] for i in sample_idx_agent]
+s_gt  = [ground_truths[i] for i in sample_idx_agent]
+
+cos_agent = cosine_sim_score(agent_clean, ground_truths)
+faith_agent = groq_faithfulness_batch(s_q, s_ans, s_ctx)
+rel_agent = groq_relevance_batch(s_q, s_ans)
+
+results_final['Multi-Agent'] = {
+    'Cosine Similarity': round(cos_agent, 4),
+    'Faithfulness': round(np.nanmean(faith_agent), 4),
+    'Answer Relevance': round(np.nanmean(rel_agent), 4),
+}
+
+df_final = pd.DataFrame(results_final).T
+df_final['Mean Score'] = df_final.mean(axis=1).round(4)
+df_final = df_final.sort_values('Mean Score', ascending=False)
+
+print('\n' + '═'*60 + '\n  COMPARAISON FINALE (incluant Multi-Agent)\n' + '═'*60)
+display(df_final.style
+    .background_gradient(cmap='RdYlGn', axis=0)
+    .format('{:.4f}')
+    .set_caption('Évaluation complète — RAG + Multi-Agent'))
+#+end_src
+
+#+begin_src python
+# ── Graphique final ──
+fig, axes = plt.subplots(1, 4, figsize=(24, 6))
+fig.suptitle('Du LLM seul au Multi-Agent (ChromaDB)', fontsize=14, fontweight='bold')
+n = len(df_final)
+colors_f = plt.cm.viridis(np.linspace(0.15, 0.95, n))
+labels_f = [l.replace(' ', '\n') for l in df_final.index]
+
+for ax, metric in zip(axes, df_final.columns):
+    vals = df_final[metric].values.astype(float)
+    bars = ax.bar(range(n), vals, color=colors_f)
+    ax.set_title(metric, fontweight='bold')
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(labels_f, rotation=55, ha='right', fontsize=7)
+    for b, v in zip(bars, vals):
+        if not np.isnan(v):
+            ax.text(b.get_x()+b.get_width()/2, b.get_height()+0.005, f'{v:.3f}', ha='center', fontsize=7)
+
+plt.tight_layout()
+plt.savefig('final_multiagent_comparison.png', dpi=150, bbox_inches='tight')
+plt.show()
+#+end_src
+
+[[file:assets/AgentRagBench.png]]
