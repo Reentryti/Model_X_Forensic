@@ -295,4 +295,4 @@ plt.savefig('final_multiagent_comparison.png', dpi=150, bbox_inches='tight')
 plt.show()
 #+end_src
 
-[[file:assets/AgentRagBench.png]]
+[[file:Metriques/AgentRagBench.png]]
