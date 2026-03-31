@@ -1,0 +1,443 @@
+#+title: Partie 0 : Forensic QA Dataset Generation
+* Pipeline
+** Text Extraction
+** Chunking
+** QA Generation
+** Cleaning & Validation
+** CheckUp
+** Json Exportation
+
+* Data Property
+- Question
+- Answer
+- Context
+- Source
+- Level
+
+* Notebook
+** Installations & Importations
+
+#+begin_src python
+#Installations
+!pip install -q pymupdf groq jsonref
+!pip install -q sentence-transformers
+!pip install -q nltk
+
+#Importations
+import os, re, json, random, time, hashlib
+from pathlib import Path
+from typing import List, Dict
+from collections import Counter
+
+import fitz
+import numpy as np
+from tqdm.auto import tqdm
+from groq import Groq
+from kaggle_secrets import UserSecretsClient
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+
+import nltk
+nltk.download('punkt', quiet=True)
+
+import warnings
+
+SEED = 42
+random.seed(SEED)
+print('Imports OK')
+#+end_src
+
+** Parameters
+
+#+begin_src python
+# Dossier contenant les PDFs (to adapt)
+PDF_FOLDER = '/kaggle/input/datasets/hacerone/forensicknowledge'
+
+# Nombre de QA à générer
+TARGET_QA = 1000
+
+# Modèle Groq pour la génération
+GROQ_MODEL = 'llama-3.3-70b-versatile'
+
+# Langue principale ('fr' ou 'en' ou 'mixed')
+LANG = 'fr'
+
+# Taille des chunks
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 200
+
+# QA par chunk
+QA_PER_CHUNK = 3
+
+# Pause entre appels Groq
+GROQ_DELAY = 2
+
+# Clé API Groq
+GROQ_KEY = UserSecretsClient().get_secret('ragroq')
+groq_client = Groq(api_key=GROQ_KEY)
+
+print(f'Config: {TARGET_QA} QA, modèle={GROQ_MODEL}, langue={LANG}')
+#+end_src
+
+** Extraction
+
+#+begin_src python
+# Extraction du texte des PDFs
+def extract_pdf(pdf_path: str) -> str:
+    
+    doc = fitz.open(pdf_path)
+    text = ''
+    for page in doc:
+        text += page.get_text('text') + '\n\n'
+    doc.close()
+    return text.strip()
+
+# Trouver tous les PDFs
+pdf_files = []
+for root, dirs, files in os.walk(PDF_FOLDER):
+    for f in files:
+        if f.lower().endswith('.pdf'):
+            pdf_files.append(os.path.join(root, f))
+
+print(f'{len(pdf_files)} PDFs trouvés')
+
+# Extraction
+documents = {}
+for pdf in tqdm(pdf_files, desc='Extraction PDFs'):
+    name = os.path.basename(pdf)
+    text = extract_pdf(pdf)
+    if len(text) > 200:
+        documents[name] = text
+        print(f'   {name}: {len(text):,} caractères')
+    else:
+        print(f'   {name}: trop court ({len(text)} car), ignoré')
+
+total_chars = sum(len(t) for t in documents.values())
+print(f'\nTotal: {len(documents)} documents, {total_chars:,} caractères')
+#+end_src
+
+** Chunking
+
+#+begin_src python
+# Découper le texte en chunks cohérents
+def smart_chunk(text: str, doc_name: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> List[Dict]:
+    
+    # Nettoyer
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    
+    paragraphs = text.split('\n\n')
+    chunks = []
+    current = ''
+    
+    for para in paragraphs:
+        para = para.strip()
+        if len(para) < 30:
+            continue
+        
+        if len(current) + len(para) > chunk_size:
+            if len(current) > 100:
+                chunks.append({'text': current.strip(), 'source': doc_name})
+            # Overlap: garder la dernière phrase du chunk précédent
+            sentences = current.split('.')
+            current = '. '.join(sentences[-2:]).strip() + ' ' + para if len(sentences) > 2 else para
+        else:
+            current += ' ' + para
+    
+    if len(current.strip()) > 100:
+        chunks.append({'text': current.strip(), 'source': doc_name})
+    
+    return chunks
+
+# Chunking de tous les documents
+all_chunks = []
+for name, text in documents.items():
+    doc_chunks = smart_chunk(text, name)
+    all_chunks.extend(doc_chunks)
+    print(f'  {name}: {len(doc_chunks)} chunks')
+
+# Filtrer les chunks de mauvaise qualité
+quality_chunks = []
+for c in all_chunks:
+    t = c['text']
+    # Skip: tables of contents, lists of numbers, headers only
+    if t.count('...') > 5: continue
+    if t.count('.') < 3: continue
+    if len(t.split()) < 30: continue
+    if sum(1 for ch in t if ch.isdigit()) / max(len(t),1) > 0.3: continue
+    quality_chunks.append(c)
+
+print(f'\nChunks totaux: {len(all_chunks)} → qualité: {len(quality_chunks)}')
+
+# Combien de chunks traiter pour atteindre TARGET_QA ?
+chunks_needed = min(len(quality_chunks), (TARGET_QA // QA_PER_CHUNK) + 20)
+selected_chunks = random.sample(quality_chunks, chunks_needed)
+print(f'Chunks sélectionnés pour génération: {len(selected_chunks)}')
+#+end_src
+
+** QA Generation
+
+#+begin_src python
+# ── Prompt de génération ──
+
+SYSTEM_PROMPT = """You are an expert in digital forensics, information security, and forensic investigation.
+Your task is to generate high-quality question-answer pairs from a given text passage.
+
+RULES:
+1. Generate exactly {n} question-answer pairs from the passage.
+2. Questions must be:
+   - Clear, grammatically correct, and unambiguous
+   - Meaningful in a digital forensics context
+   - In {lang} (French if 'fr', English if 'en', mixed if 'mixed')
+   - NOT trivial (no "What is the title?" or "What page is this?")
+3. Answers must be:
+   - Complete sentences (1-3 sentences, 40-250 characters)
+   - Self-contained (understandable without the context)
+   - Technically accurate based ONLY on the passage
+   - In the same language as the question
+4. Assign a difficulty level to each pair:
+   - "basic": definition or simple recall
+   - "intermediate": applied understanding, procedures
+   - "advanced": reasoning, trade-offs, expert knowledge
+
+RESPOND ONLY with a JSON array, no other text:
+[
+  {{"question": "...", "answer": "...", "difficulty": "basic|intermediate|advanced"}},
+  ...
+]"""
+
+def generate_qa_from_chunk(chunk: Dict, n: int = QA_PER_CHUNK) -> List[Dict]:
+    """Génère n paires Q/R à partir d'un chunk via Groq."""
+    text = chunk['text'][:2000]  # limiter la taille
+    source = chunk['source']
+    
+    lang_map = {'fr': 'French', 'en': 'English', 'mixed': 'French or English based on the passage language'}
+    
+    try:
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {'role': 'system', 'content': SYSTEM_PROMPT.format(n=n, lang=lang_map.get(LANG, 'French'))},
+                {'role': 'user', 'content': f'Generate {n} forensic QA pairs from this passage:\n\n{text}'}
+            ],
+            temperature=0.3,
+            max_tokens=1500,
+        )
+        
+        raw = response.choices[0].message.content.strip()
+        
+        # Parser le JSON
+        raw = re.sub(r'^```json\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+        
+        qa_list = json.loads(raw)
+        
+        # Ajouter context et source
+        results = []
+        for qa in qa_list:
+            if 'question' in qa and 'answer' in qa:
+                qa['context'] = text[:500]
+                qa['source'] = source
+                if 'difficulty' not in qa:
+                    qa['difficulty'] = 'intermediate'
+                results.append(qa)
+        
+        return results
+    
+    except json.JSONDecodeError as e:
+        print(f'  ⚠ JSON invalide pour {source}: {e}')
+        return []
+    except Exception as e:
+        print(f'  ⚠ Erreur Groq: {e}')
+        return []
+
+print('Fonction de génération prête.')
+#+end_src
+
+#+begin_src python
+# Boucle de génération
+all_qa = []
+errors = 0
+
+print(f'Génération de ~{len(selected_chunks) * QA_PER_CHUNK} QA à partir de {len(selected_chunks)} chunks...\n')
+
+for i, chunk in enumerate(tqdm(selected_chunks, desc='Génération QA')):
+    qa_pairs = generate_qa_from_chunk(chunk)
+    all_qa.extend(qa_pairs)
+    
+    if not qa_pairs:
+        errors += 1
+    
+    # Pause pour rate limit Groq
+    time.sleep(GROQ_DELAY)
+    
+    # Progress
+    if (i + 1) % 20 == 0:
+        print(f'  [{i+1}/{len(selected_chunks)}] {len(all_qa)} QA générées ({errors} erreurs)')
+
+print(f'\n Génération terminée: {len(all_qa)} QA brutes ({errors} erreurs)')
+#+end_src
+
+** Validation
+
+#+begin_src python
+# Validation automatique
+def validate_qa(qa: Dict) -> bool:
+   
+    q = qa.get('question', '').strip()
+    a = qa.get('answer', '').strip()
+    c = qa.get('context', '').strip()
+    
+    # Question
+    if len(q) < 15: return False
+    if q.count('?') != 1: return False
+    if not q[0].isupper(): return False
+    if len(q.split()) < 5: return False
+    
+    # Patterns de mauvaises questions
+    bad_patterns = [
+        r'^What (is|are|does) .{3,20}(the |a |if |however|not |it |that |although)',
+        r'^What (is|are) .{3,10}\?$',
+    ]
+    for pat in bad_patterns:
+        if re.match(pat, q, re.IGNORECASE): return False
+    
+    # Mots interdits dans les questions
+    if any(x in q.lower() for x in ['page ', 'table ', 'figure ', 'section ', 'paragraph ']):
+        return False
+    
+    # Answer
+    if len(a) < 40: return False
+    if len(a) > 600: return False
+    if not a[0].isupper(): return False
+    if not a.rstrip().endswith('.'): return False
+    if len(a.split()) < 8: return False
+    
+    # Non-réponses
+    non_answers = ['non spécifié', 'not specified', 'n/a', 'non mentionné',
+                   'not available', 'il n\'est pas', 'not mentioned', 'unknown']
+    if any(x in a.lower() for x in non_answers): return False
+    
+    # Context
+    if len(c) < 50: return False
+    
+    # Difficulty
+    if qa.get('difficulty') not in ['basic', 'intermediate', 'advanced']:
+        qa['difficulty'] = 'intermediate'
+    
+    return True
+
+# Appliquer la validation
+valid_qa = [qa for qa in all_qa if validate_qa(qa)]
+rejected = len(all_qa) - len(valid_qa)
+
+print(f'Validation: {len(all_qa)} brutes → {len(valid_qa)} valides ({rejected} rejetées, {100*rejected/max(len(all_qa),1):.1f}%)')
+#+end_src
+
+#+begin_src python
+# Déduplication
+# 1) Dédup exacte par hash de question
+seen_hashes = set()
+deduped = []
+for qa in valid_qa:
+    key = hashlib.md5(qa['question'].lower().strip()[:80].encode()).hexdigest()
+    if key not in seen_hashes:
+        seen_hashes.add(key)
+        deduped.append(qa)
+
+print(f'Dédup exacte: {len(valid_qa)} → {len(deduped)}')
+
+# 2) Dédup sémantique
+if len(deduped) > 50:
+    sim_model = SentenceTransformer('all-MiniLM-L6-v2')
+    q_texts = [qa['question'] for qa in deduped]
+    embeddings = sim_model.encode(q_texts, show_progress_bar=True)
+    
+    # Trouver les paires trop similaires
+    to_remove = set()
+    for i in range(len(embeddings)):
+        if i in to_remove: continue
+        for j in range(i+1, len(embeddings)):
+            if j in to_remove: continue
+            sim = float(cosine_similarity([embeddings[i]], [embeddings[j]])[0][0])
+            if sim > 0.90:
+                # Garder la question avec la meilleure réponse
+                if len(deduped[i]['answer']) >= len(deduped[j]['answer']):
+                    to_remove.add(j)
+                else:
+                    to_remove.add(i)
+    
+    deduped = [qa for i, qa in enumerate(deduped) if i not in to_remove]
+    print(f'Dédup sémantique: supprimé {len(to_remove)} doublons → {len(deduped)} restantes')
+
+print(f'\nDataset après déduplication: {len(deduped)} QA')
+#+end_src
+
+** Stats
+
+#+begin_src python
+# ── Statistiques ──
+print('═' * 60)
+print(f'  DATASET: {len(deduped)} QA')
+print('═' * 60)
+
+# Difficulté
+diff = Counter(qa['difficulty'] for qa in deduped)
+print(f'\nDifficulté:')
+for k in ['basic', 'intermediate', 'advanced']:
+    n = diff.get(k, 0)
+    pct = 100 * n / len(deduped)
+    bar = '█' * int(pct / 2)
+    print(f'  {k:15s} {n:4d} ({pct:5.1f}%) {bar}')
+
+# Sources
+src = Counter(qa['source'] for qa in deduped)
+print(f'\nSources ({len(src)} documents):')
+for name, count in src.most_common():
+    print(f'  {name}: {count}')
+
+# Longueurs
+q_lens = [len(qa['question']) for qa in deduped]
+a_lens = [len(qa['answer']) for qa in deduped]
+print(f'\nQuestions: min={min(q_lens)}, moy={sum(q_lens)//len(q_lens)}, max={max(q_lens)}')
+print(f'Réponses:  min={min(a_lens)}, moy={sum(a_lens)//len(a_lens)}, max={max(a_lens)}')
+
+# Exemples
+print(f'\n{"─"*60}')
+print('EXEMPLES (5 aléatoires):')
+print(f'{"─"*60}')
+for qa in random.sample(deduped, min(5, len(deduped))):
+    print(f'[{qa["difficulty"]}] Q: {qa["question"]}')
+    print(f'  A: {qa["answer"][:200]}')
+    print(f'  S: {qa["source"]}')
+    print()
+
+#+end_src
+
+** Exportation
+
+#+begin_src python
+# Sauvegarde du dataset
+OUTPUT_PATH = '/kaggle/working/forensic_qa_generated.json'
+
+# Shuffle final
+random.shuffle(deduped)
+
+# Limiter à TARGET_QA si on en a trop
+final_dataset = deduped[:TARGET_QA] if len(deduped) > TARGET_QA else deduped
+
+# Sauvegarder
+with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
+    json.dump(final_dataset, f, ensure_ascii=False, indent=2)
+
+print(f' Dataset sauvegardé: {OUTPUT_PATH}')
+print(f'  {len(final_dataset)} QA')
+print(f'  Taille: {os.path.getsize(OUTPUT_PATH)/1024:.1f} KB')
+
+# Vérification de format
+with open(OUTPUT_PATH) as f:
+    check = json.load(f)
+assert len(check) == len(final_dataset)
+assert all(k in check[0] for k in ['question', 'answer', 'context', 'source', 'difficulty'])
+print(' Format vérifié: compatible avec le pipeline RAG')
+#+end_src
